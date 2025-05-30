@@ -1,10 +1,10 @@
 {
     "file_format_version" : "1.0.0",
     "layer" : {
-        "name": "VK_LAYER_AEJS_DeviceChooserLayer",
+        "name": "VK_LAYER_DeviceChooserLayer",
         "type": "GLOBAL",
         "library_path": "libvkdevicechooser.so",
-        "api_version": "1.2.131",
+        "api_version": "1.4.313",
         "implementation_version": "1",
         "description": "Device chooser layer",
         "functions": {

@@ -1,1 +1,5 @@
-builddir
+build
+vkdevicechooser
+src
+pkg
+*.zst

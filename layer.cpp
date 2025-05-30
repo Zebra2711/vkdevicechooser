@@ -1,48 +1,27 @@
-#include "vulkan/vulkan.h"
 #include "vulkan/vk_layer.h"
-#include "vulkan/vk_layer_dispatch_table.h"
+#include "vk_layer_table.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <vector>
 
 #undef VK_LAYER_EXPORT
 #define VK_LAYER_EXPORT extern "C"
 
-static std::map<void*, VkLayerInstanceDispatchTable> gInstanceDispatch;
-static std::map<void*, VkLayerDispatchTable> gDeviceDispatch;
+static instance_table_map gInstanceDispatch;
+static device_table_map  gDeviceDispatch;
 
 static constexpr char kEnvVariable[] = "VULKAN_DEVICE_INDEX";
 
-template <typename DispatchableType>
-inline void* GetKey(DispatchableType object)
-{
-    return *(void**)object;
-}
-
-template <typename DispatchableType>
-inline VkLayerInstanceDispatchTable& GetInstanceDispatch(DispatchableType object)
-{
-    return gInstanceDispatch[GetKey(object)];
-}
-
-template <typename DispatchableType>
-inline VkLayerDispatchTable& GetDeviceDispatch(DispatchableType object)
-{
-    return gDeviceDispatch[GetKey(object)];
-}
-
 static VkResult ChooseDevice(VkInstance                          instance,
-                             const VkLayerInstanceDispatchTable& dispatch,
+                             const VkuInstanceDispatchTable*     dispatch,
                              const char* const                   env,
                              VkPhysicalDevice&                   outDevice)
 {
     std::vector<VkPhysicalDevice> devices;
     uint32_t count = 0;
-
-    VkResult result = dispatch.EnumeratePhysicalDevices(instance, &count, nullptr);
+    VkResult result = dispatch->EnumeratePhysicalDevices(instance, &count, nullptr);
 
     if (result != VK_SUCCESS)
     {
@@ -55,24 +34,99 @@ static VkResult ChooseDevice(VkInstance                          instance,
     }
 
     devices.resize(count);
-
-    result = dispatch.EnumeratePhysicalDevices(instance, &count, &devices[0]);
+    result = dispatch->EnumeratePhysicalDevices(instance, &count, devices.data());
 
     if (result != VK_SUCCESS)
     {
         return result;
     }
 
-    int deviceIndex = atoi(env);
 
-    if (deviceIndex >= count)
+    if (env && !strcmp(env, "list"))
     {
-        fprintf(stderr, "Device index %d does not exist, returning device 0\n", deviceIndex);
-        deviceIndex = 0;
+        for (size_t i = 0; i < devices.size(); ++i)
+        {
+            VkPhysicalDeviceProperties props;
+            dispatch->GetPhysicalDeviceProperties(devices[i], &props);
+
+            VkPhysicalDeviceDriverProperties driverProps{};
+            driverProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+            VkPhysicalDeviceProperties2 extendedProps{};
+            extendedProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            extendedProps.pNext = &driverProps;
+            dispatch->GetPhysicalDeviceProperties2(devices[i], &extendedProps);
+
+            fprintf(stderr, "CPU%zu:\n", i);
+            fprintf(stderr, "        deviceName = %s\n", props.deviceName);
+            fprintf(stderr, "        driverInfo = %s\n", driverProps.driverInfo);
+        }
+        exit(0);
+    }
+
+    static uint8_t deviceIndex = [&]() {
+        unsigned long v = env && *env ? strtoul(env, nullptr, 10) : UINT8_MAX + 1;
+        return v <= UINT8_MAX ? static_cast<uint8_t>(v) : UINT8_MAX;
+    }();
+
+    // Fall back GPU Discrete -> Integrated -> Virtual -> CPU
+    int8_t discrete_idx = -1;
+    int8_t integrated_idx = -1;
+    int8_t virtual_idx = -1;
+    int8_t cpu_idx = -1;
+
+    if (deviceIndex < 0 || deviceIndex >= static_cast<uint8_t>(count))
+    {
+        VkPhysicalDeviceProperties deviceProps;
+        for (uint8_t i = 0; i < count; i++) {
+            dispatch->GetPhysicalDeviceProperties(devices[i], &deviceProps);
+            switch(deviceProps.deviceType)
+            {
+            case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+            default:
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+                discrete_idx = i;
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+                integrated_idx = i;
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+                virtual_idx = i;
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_CPU:
+                deviceIndex = i;
+                break;
+            }
+        }
     }
     else
-    {
         printf("Using Vulkan device index %d\n", deviceIndex);
+
+    if (discrete_idx >= 0) 
+    {
+        deviceIndex = discrete_idx;
+        fprintf(stderr, "Selected discrete GPU at index %d\n", deviceIndex);
+    } 
+    else if (integrated_idx >= 0) 
+    {
+        deviceIndex = integrated_idx;
+        fprintf(stderr, "No discrete GPU found, selected integrated GPU at index %d\n", deviceIndex);
+    } 
+    else if (virtual_idx >= 0) 
+    {
+        deviceIndex = virtual_idx;
+        fprintf(stderr, "No discrete/integrated GPU found, selected virtual GPU at index %d\n", deviceIndex);
+    }
+    else if (cpu_idx >= 0)
+    {
+        deviceIndex = cpu_idx;
+        fprintf(stderr, "No GPU found, selected CPU at index %d\n", deviceIndex);
+    }
+
+    if (!discrete_idx && !integrated_idx && !virtual_idx && !cpu_idx)
+    {
+        fprintf(stderr, "Can not select any devices");
+        exit(0);
     }
 
     outDevice = devices[deviceIndex];
@@ -84,16 +138,20 @@ DeviceChooserLayer_EnumeratePhysicalDevices(VkInstance        instance,
                                             uint32_t*         pPhysicalDeviceCount,
                                             VkPhysicalDevice* pPhysicalDevices)
 {
-    const VkLayerInstanceDispatchTable& dispatch = GetInstanceDispatch(instance);
+    const VkuInstanceDispatchTable* const dispatch = instance_dispatch_table(instance);
 
-    const char* const env = getenv(kEnvVariable);
+    if (!dispatch)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    static const char* const env = getenv(kEnvVariable);
+
     if (!env)
     {
-        return dispatch.EnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
+        return dispatch->EnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
     }
 
-    VkPhysicalDevice device;
-    VkResult result = ChooseDevice(instance, dispatch, env, device);
+    VkPhysicalDevice device = VK_NULL_HANDLE;
+    const VkResult result = ChooseDevice(instance, dispatch, env, device);
 
     if (result != VK_SUCCESS)
     {
@@ -121,12 +179,12 @@ DeviceChooserLayer_EnumeratePhysicalDeviceGroupsKHR(VkInstance                  
                                                     uint32_t*                           pPhysicalDeviceGroupCount,
                                                     VkPhysicalDeviceGroupPropertiesKHR* pPhysicalDeviceGroups)
 {
-    const VkLayerInstanceDispatchTable& dispatch = GetInstanceDispatch(instance);
+    VkuInstanceDispatchTable* dispatch = instance_dispatch_table(instance);
 
-    const char* const env = getenv(kEnvVariable);
+    static const char* const env = getenv(kEnvVariable);
     if (!env)
     {
-        return dispatch.EnumeratePhysicalDeviceGroupsKHR(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroups);
+        return dispatch->EnumeratePhysicalDeviceGroupsKHR(instance, pPhysicalDeviceGroupCount, pPhysicalDeviceGroups);
     }
 
     /* Just return a single device group containing the requested device. */
@@ -170,45 +228,18 @@ DeviceChooserLayer_CreateInstance(const VkInstanceCreateInfo*  pCreateInfo,
                                   const VkAllocationCallbacks* pAllocator,
                                   VkInstance*                  pInstance)
 {
-    VkLayerInstanceCreateInfo* layerCreateInfo = (VkLayerInstanceCreateInfo*)pCreateInfo->pNext;
-
-    while (layerCreateInfo && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO ||
-                               layerCreateInfo->function != VK_LAYER_LINK_INFO))
-    {
-        layerCreateInfo = (VkLayerInstanceCreateInfo*)layerCreateInfo->pNext;
-    }
-
-    if (!layerCreateInfo)
-    {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    VkLayerInstanceCreateInfo* layerCreateInfo = get_chain_info(pCreateInfo, VK_LAYER_LINK_INFO);
 
     PFN_vkGetInstanceProcAddr gpa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-
     layerCreateInfo->u.pLayerInfo = layerCreateInfo->u.pLayerInfo->pNext;
 
     PFN_vkCreateInstance createFunc = (PFN_vkCreateInstance)gpa(VK_NULL_HANDLE, "vkCreateInstance");
 
     VkResult ret = createFunc(pCreateInfo, pAllocator, pInstance);
     if (ret != VK_SUCCESS)
-    {
         return ret;
-    }
 
-    #define GET(func) \
-        dispatchTable.func = (PFN_vk##func)gpa(*pInstance, "vk" #func);
-
-    VkLayerInstanceDispatchTable dispatchTable;
-    dispatchTable.GetInstanceProcAddr = gpa;
-    GET(EnumerateDeviceExtensionProperties);
-    GET(DestroyInstance);
-    GET(EnumeratePhysicalDevices);
-    GET(EnumeratePhysicalDeviceGroups);
-    GET(EnumeratePhysicalDeviceGroupsKHR);
-
-    #undef GET
-
-    gInstanceDispatch[GetKey(*pInstance)] = dispatchTable;
+    initInstanceTable(*pInstance, gpa);
 
     return VK_SUCCESS;
 }
@@ -217,11 +248,11 @@ VK_LAYER_EXPORT void VKAPI_CALL
 DeviceChooserLayer_DestroyInstance(VkInstance                   instance,
                                    const VkAllocationCallbacks* pAllocator)
 {
-    void* const key = GetKey(instance);
+    VkuInstanceDispatchTable* dispatch = instance_dispatch_table(instance);
+    dispatch_key key = get_dispatch_key(instance);
 
-    gInstanceDispatch[key].DestroyInstance(instance, pAllocator);
-
-    gInstanceDispatch.erase(key);
+    dispatch->DestroyInstance(instance, pAllocator);
+    gInstanceDispatch.erase((void*)key);
 }
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL
@@ -230,18 +261,7 @@ DeviceChooserLayer_CreateDevice(VkPhysicalDevice             physicalDevice,
                                 const VkAllocationCallbacks* pAllocator,
                                 VkDevice*                    pDevice)
 {
-    VkLayerDeviceCreateInfo* layerCreateInfo = (VkLayerDeviceCreateInfo*)pCreateInfo->pNext;
-
-    while (layerCreateInfo && (layerCreateInfo->sType != VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO ||
-                               layerCreateInfo->function != VK_LAYER_LINK_INFO))
-    {
-        layerCreateInfo = (VkLayerDeviceCreateInfo*)layerCreateInfo->pNext;
-    }
-
-    if (!layerCreateInfo)
-    {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    }
+    VkLayerDeviceCreateInfo* layerCreateInfo = get_chain_info(pCreateInfo, VK_LAYER_LINK_INFO);
 
     PFN_vkGetInstanceProcAddr gipa = layerCreateInfo->u.pLayerInfo->pfnNextGetInstanceProcAddr;
     PFN_vkGetDeviceProcAddr gdpa   = layerCreateInfo->u.pLayerInfo->pfnNextGetDeviceProcAddr;
@@ -256,16 +276,7 @@ DeviceChooserLayer_CreateDevice(VkPhysicalDevice             physicalDevice,
         return ret;
     }
 
-    #define GET(func) \
-        dispatchTable.func = (PFN_vk##func)gdpa(*pDevice, "vk" #func);
-
-    VkLayerDispatchTable dispatchTable;
-    dispatchTable.GetDeviceProcAddr = gdpa;
-    GET(DestroyDevice);
-
-    #undef GET
-
-    gDeviceDispatch[GetKey(*pDevice)] = dispatchTable;
+    initDeviceTable(*pDevice, gdpa);
 
     return VK_SUCCESS;
 }
@@ -274,11 +285,11 @@ VK_LAYER_EXPORT void VKAPI_CALL
 DeviceChooserLayer_DestroyDevice(VkDevice                     device,
                                  const VkAllocationCallbacks* pAllocator)
 {
-    void* const key = GetKey(device);
+    VkuDeviceDispatchTable* dispatch = device_dispatch_table(device);
+    dispatch_key key = get_dispatch_key(device);
 
-    gDeviceDispatch[key].DestroyDevice(device, pAllocator);
-
-    gDeviceDispatch.erase(key);
+    dispatch->DestroyDevice(device, pAllocator);
+    gDeviceDispatch.erase((void*)key);
 }
 
 VK_LAYER_EXPORT VkResult VKAPI_CALL
@@ -286,17 +297,15 @@ DeviceChooserLayer_EnumerateInstanceLayerProperties(uint32_t*          pProperty
                                                     VkLayerProperties* pProperties)
 {
     if (pPropertyCount)
-    {
         *pPropertyCount = 1;
-    }
 
     if (pProperties)
     {
-        strcpy(pProperties->layerName,   "VK_LAYER_AEJS_DeviceChooserLayer");
-        strcpy(pProperties->description, "Device chooser layer");
+        snprintf(pProperties->layerName,   sizeof(pProperties->layerName),   "VK_LAYER_DeviceChooserLayer");
+        snprintf(pProperties->description, sizeof(pProperties->description), "Device chooser layer");
 
         pProperties->implementationVersion = 1;
-        pProperties->specVersion           = VK_API_VERSION_1_0;
+        pProperties->specVersion           = VK_API_VERSION_1_4;
     }
 
     return VK_SUCCESS;
@@ -315,7 +324,7 @@ DeviceChooserLayer_EnumerateInstanceExtensionProperties(const char*            p
                                                         uint32_t*              pPropertyCount,
                                                         VkExtensionProperties* pProperties)
 {
-    if (!pLayerName || strcmp(pLayerName, "VK_LAYER_AEJS_DeviceChooserLayer"))
+    if (!pLayerName || strcmp(pLayerName, "VK_LAYER_DeviceChooserLayer"))
     {
         return VK_ERROR_LAYER_NOT_PRESENT;
     }
@@ -334,17 +343,15 @@ DeviceChooserLayer_EnumerateDeviceExtensionProperties(VkPhysicalDevice       phy
                                                       uint32_t*              pPropertyCount,
                                                       VkExtensionProperties* pProperties)
 {
-    if (!pLayerName || strcmp(pLayerName, "VK_LAYER_AEJS_DeviceChooserLayer"))
+    if (!pLayerName || strcmp(pLayerName, "VK_LAYER_DeviceChooserLayer"))
     {
         if (physicalDevice == VK_NULL_HANDLE)
-        {
             return VK_SUCCESS;
-        }
 
-        return GetInstanceDispatch(physicalDevice).EnumerateDeviceExtensionProperties(physicalDevice,
-                                                                                      pLayerName,
-                                                                                      pPropertyCount,
-                                                                                      pProperties);
+        return instance_dispatch_table(physicalDevice)->EnumerateDeviceExtensionProperties(physicalDevice,
+                                                                                           pLayerName,
+                                                                                           pPropertyCount,
+                                                                                           pProperties);
     }
 
     if (pPropertyCount)
@@ -367,7 +374,7 @@ DeviceChooserLayer_GetDeviceProcAddr(VkDevice    device,
     GETPROCADDR(CreateDevice);
     GETPROCADDR(DestroyDevice);
 
-    return GetDeviceDispatch(device).GetDeviceProcAddr(device, pName);
+    return device_dispatch_table(device)->GetDeviceProcAddr(device, pName);
 }
 
 VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL
@@ -389,5 +396,5 @@ DeviceChooserLayer_GetInstanceProcAddr(VkInstance  instance,
     GETPROCADDR(CreateDevice);
     GETPROCADDR(DestroyDevice);
 
-    return GetInstanceDispatch(instance).GetInstanceProcAddr(instance, pName);
+    return instance_dispatch_table(instance)->GetInstanceProcAddr(instance, pName);
 }
